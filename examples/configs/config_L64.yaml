@@ -1,0 +1,84 @@
+# config_L64.yaml
+# L = 64, 在临界区域附近用 Metropolis + GPU 做 REMC，
+# 同时在更大区间 [1.6, 3.2] 上生成机器学习数据集。
+
+simulation:
+  # 晶格尺寸
+  L: 64
+
+  # 这里的 T_min / T_max 主要是“物理参考窗口”（临界附近），不会直接用来铺点；
+  # 真实的数据网格由 data.T_range / data.n_T 决定。
+  T_min: 2.00
+  T_max: 2.50
+
+  # REMC 的副本数（温度数）；在 run_data_from_config.py 的 REMC 模式下，
+  # 会被 data.n_T 覆盖（以 data.T_range 上的温度网格为准）。
+  num_replicas: 16
+
+  # 外场（本示例只做零外场）
+  h_field: 0.0
+
+  # 算法名称；会在 SimulationConfig 中归一化为 'metropolis_sweep'
+  algorithm: "metropolis"
+
+  # 边界条件：周期性边界 (Periodic Boundary Conditions)
+  boundary: "pbc"
+
+  # 后端：'cpu' | 'gpu' | 'auto'
+  # 这里使用 GPU，要求你已安装 CuPy 且 gpu_remc_simulator 可用。
+  # backend: "gpu"
+  backend: "cpu"
+
+  # 每条链的热化步数 / 采样步数上限（主要用于 GUI 或其它脚本时做参考）
+  equilibration: 10000
+  production: 20000
+
+  # REMC 交换间隔（步数）
+  exchange_interval: 10
+
+  # 随机种子
+  seed: 2025
+
+
+data:
+  # 希望数据集中所有构型的 L；推荐与 simulation.L 保持一致
+  L: 64
+
+  # 数据集要覆盖的温度范围（全局）
+  T_range: [1.6, 3.2]
+
+  # 在 T_range 上取多少个温度点
+  n_T: 40
+
+  # 每个温度期望得到多少个样本（大致值）
+  n_configs: 1000
+
+  # 数据生产专用的热化步数（优先于 simulation.equilibration）
+  equilibration: 8192
+
+  # 采样间隔（thin 的值）：每隔多少步保存一个构型
+  sampling_interval: 8
+
+  # 是否在一个 REMC 模拟中跨整个 T_range
+  #   true  → REMC 模式：一个模拟覆盖所有 temps（温度网格）
+  #   false → 单温度模式：每个 T 独立跑一个 num_replicas=1 的 MC
+  use_remc: true
+
+  # 外场扫描范围：本示例不做 h 扫描，因此设为 null
+  h_range: null
+
+  # 输出目录（可以是相对路径，run_data_from_config.py 会用它创建 tmp/、merged/、pytorch/）
+  output_dir: "data/ising_L64"
+
+  # 是否导出为 PyTorch 训练集
+  export_pytorch: true
+
+  # 导出数据类型：'uint8' (紧凑，适合图像类网络) 或 'float32'
+  export_dtype: "uint8"
+
+  # 训练/验证划分比例
+  train_split: 0.8
+
+  # 是否对导出的数据做归一化（例如把自旋映射到 {0,1} 或 [0,1]）
+  normalize: true
+

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ising-fss"
+version = "0.1.0"
+description = "Ising-model REMC samplers (CPU + optional GPU) and analysis tools"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Li"}
+]
+requires-python = ">=3.9"
+keywords = ["ising", "monte-carlo", "remc", "fss", "statistical-physics"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+# Minimal runtime deps (keep GPU libs out of install_requires)
+dependencies = [
+  "numpy>=1.23",
+  "h5py>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-mock",
+  "flake8",
+  "black",
+  "mypy",
+]
+# GPU: do NOT pin a specific cupy wheel here. Document installation in README.
+gpu = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

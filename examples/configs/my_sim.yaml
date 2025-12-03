@@ -1,0 +1,18 @@
+simulation:
+  L: 64
+  T_min: 2.20
+  T_max: 2.35
+  num_replicas: 16
+  h_field: 0.0
+  algorithm: "metropolis"   # 会归一为 'metropolis_sweep'
+  boundary: "pbc"
+  backend: "gpu"
+  equilibration: 10000
+  production: 20000
+
+data:
+  L: 64
+  T_range: [1.0, 5.0]
+  n_T: 65
+  n_configs: 1024
+
