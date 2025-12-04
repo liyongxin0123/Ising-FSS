@@ -2,3 +2,4 @@ examples/runs/
 *.json
 *.h5
 *.npz
+docs/
