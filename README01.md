@@ -385,3 +385,289 @@ YAML 中主要字段就是前面的 `SimulationConfig` / `DataConfig`。脚本�
 
 ```
 ```
+
+---
+---
+
+那我给你搭一个**真的能跑起来、又尽量“极简”的工作流**，专门为“插值论文里的 Ising 高维函数示例”服务。我们先只做**一个固定尺寸 L=32、一个临界附近温度 T≈Tc 的例子**，把 pipeline 全打通；以后想扩展到多温度 / FSS，再在这个基础上加就行。
+
+---
+
+## 总览：最小闭环的 5 步
+
+1. **用 REMC 生成 Ising 自旋样本 ({\sigma})**（HDF5 存盘）
+2. **从 HDF5 读出某个温度 T0 的样本，整理成训练集**
+3. **用 TNN 拟合高维函数 (\Psi_\theta(\sigma) \approx \log P(\sigma;T_0) + \text{const})**
+4. **用 TNN 做高维求和，算 (\langle H\rangle,\langle H^2\rangle,\langle M\rangle,\langle M^2\rangle)**
+5. **和蒙特卡洛的真值（sim.analyze）对比，作为论文里的主实验图**
+
+下面每一步都给一个“可以直接改的脚本骨架”。
+
+---
+
+## 第 1 步：用 REMC 生成样本（只为 TNN 提供数据）
+
+**目标**：固定一个系统
+
+* 维度：2D
+* 线性尺寸：`L = 32`
+* 外场：`h = 0`
+* 温度：围绕 (T_c \simeq 2.269185)，例如 `T_min=2.0, T_max=2.6`，`num_replicas=12`（几何 spacing）。
+
+我们只关心：**生成足够多的格点配置并写入 HDF5**。
+
+```python
+# scripts/gen_data_for_tnn.py
+from __future__ import annotations
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+for p in (ROOT, ROOT / "src"):
+    s = str(p)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+from ising_fss.simulation.remc_simulator import HybridREMCSimulator
+from ising_fss.simulation.dispatcher import make_replica_seeds
+
+def main():
+    L = 32
+    h = 0.0
+    T_min, T_max = 2.0, 2.6
+    num_replicas = 12
+
+    # 固定随机种子，方便复现
+    replica_seeds = make_replica_seeds(master_seed=2025, n_replicas=num_replicas)
+
+    sim = HybridREMCSimulator(
+        L=L,
+        T_min=T_min,
+        T_max=T_max,
+        num_replicas=num_replicas,
+        algorithm="metropolis_sweep",  # 先用单自旋算法，最稳
+        h=h,
+        replica_seeds=replica_seeds,
+    )
+
+    sim.run(
+        equilibration_steps=20_000,     # 先热化
+        production_steps=100_000,       # 采样步
+        exchange_interval=10,
+        thin=20,                        # 每 20 步采一次
+        auto_thin=False,                # 为了简单，先关闭自适应 thin
+        save_lattices=True,             # ★ 关键：写 HDF5
+        save_dir="runs/ising_L32_T_range",
+        worker_id="L32_Tc_for_tnn",
+    )
+
+    # 顺手算一下传统物理量，留作对比用
+    results = sim.analyze(verbose=True)
+    print("Available T keys:", [k for k in results.keys() if k.startswith("T_")])
+
+if __name__ == "__main__":
+    main()
+```
+
+**大概会产生：**
+
+* 目录：`runs/ising_L32_T_range/`
+
+  * 若干 HDF5：`L32_Tc_for_tnn__latt_T_2.269185_h0.000000.h5` 等
+
+    * dataset `"lattices"`：形状大致是 `(≈5000, 32, 32)`
+    * group `"provenance"`：记录 `L`, `T`, `samples_written`, `thin` 等
+  * `L32_Tc_for_tnn__metadata.json`：里面有每个温度的 `samples_per_temp`
+
+**样本数估计：**
+
+* `production_steps=100000`, `thin=20` → 每个温度大约 `100000/20 = 5000` 帧
+* 对单温度的 TNN 来说，5000 是一个不错的起步规模。
+
+---
+
+## 第 2 步：从 HDF5 抽取某个温度 T0 的样本
+
+我们选择**最接近临界温度**的那个 HDF5 文件，例如名字中 `T_2.269185`。
+
+写一个小脚本 / 数据加载器：
+
+```python
+# scripts/load_ising_hdf5.py
+import h5py
+import numpy as np
+from pathlib import Path
+
+def load_lattices_for_T(h5_path: str, max_samples: int | None = None):
+    with h5py.File(h5_path, "r") as f:
+        latt = f["lattices"][...]   # shape (N, L, L), int8, values in {-1, +1}
+    if max_samples is not None and latt.shape[0] > max_samples:
+        idx = np.random.choice(latt.shape[0], size=max_samples, replace=False)
+        latt = latt[idx]
+    # 展平，并转为 float32
+    N, L, _ = latt.shape
+    x = latt.reshape(N, L * L).astype(np.float32)   # shape (N, 1024)
+    return x
+
+if __name__ == "__main__":
+    base = Path("runs/ising_L32_T_range")
+    # 你可以手动选文件，也可以写点逻辑按温度名匹配
+    h5_file = next(base.glob("L32_Tc_for_tnn__latt_T_2.269185*_h0*.h5"))
+    X = load_lattices_for_T(str(h5_file), max_samples=5000)
+    print("Loaded samples:", X.shape)  # (N_samples, 1024)
+```
+
+接下来在 TNN 训练代码里，只要调用 `load_lattices_for_T(...)`，就能拿到一个 `N_samples × 1024` 的矩阵——这就是你的**高维自变量 (\sigma)**。
+
+---
+
+## 第 3 步：定义 TNN 的插值任务（高维 (\log P)）
+
+在这个最小工作流里，我们先**只针对一个温度 (T_0)**：
+
+* 真分布：
+  [
+  P(\sigma;T_0) = \frac{1}{Z(T_0)} e^{-\beta_0 H(\sigma)},\quad \beta_0 = 1/T_0
+  ]
+* TNN 模型：
+  [
+  P_\theta(\sigma) = \frac{1}{Z_\theta} \exp(\Psi_\theta(\sigma)),
+  ]
+  其中 (\Psi_\theta) 是你设计的 TNN 张量网络（可积结构）。
+
+**训练目标：最大化似然（或最小化负对数似然）：**
+
+[
+\mathcal{L}(\theta) = -\frac{1}{K} \sum_{k=1}^K \log P_\theta(\sigma^{(k)})
+= -\frac{1}{K} \sum_{k=1}^K \Psi_\theta(\sigma^{(k)}) + \log Z_\theta
+]
+
+* 关键点：
+
+  * (\log Z_\theta = \log \sum_\sigma e^{\Psi_\theta(\sigma)})
+  * 这一步就是用**你的 TNN 高维积分算法**来算；普通 FNN 做不到。
+
+训练伪代码（不管你用 JAX / PyTorch / 自己的 C++）：
+
+```python
+# 伪代码，结构示意思想：
+X = load_lattices_for_T(h5_file, max_samples=5000)  # (N, 1024)
+
+tnn = TNNModel(L=32, rank=R, ...)   # 你的张量网络结构
+
+for epoch in range(num_epochs):
+    for batch in iterate_minibatches(X, batch_size):
+        # 1. 计算 Psi_theta(σ) for 批量样本
+        psi_batch = tnn.forward(batch)   # shape (batch_size,)
+
+        # 2. 计算 log Z_theta，通过张量网络的精确求和
+        logZ = tnn.log_partition_function()  # 标量
+
+        # 3. 构造负 log-likelihood
+        loss = -(psi_batch.mean() - logZ)
+
+        # 4. 反向传播 + 优化
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+```
+
+**在插值论文里，这一步的“卖点”：**
+
+> 你可以直接在高维空间 (\sigma \in {-1,+1}^{1024}) 上做最大似然训练，因为 TNN 允许你精确计算 (Z_\theta)。这属于“对高维 log 概率密度的插值”。
+
+---
+
+## 第 4 步：用 TNN 做高维求和，算热力学量
+
+训练好之后，就进入“展示 TNN 优势”的环节：**用 TNN 代替真实 Boltzmann 分布做高维积分**。
+
+### 4.1 用 TNN 分布定义期望
+
+* 在 TNN 模型下，对任意函数 (F(\sigma))，
+  期望为：
+  [
+  \langle F \rangle_\theta = \sum_{\sigma} F(\sigma), P_\theta(\sigma)
+  ]
+* 对我们来说，需要：
+
+  * (H(\sigma))（Ising 能量）
+  * (M(\sigma) = \sum_i \sigma_i)（总磁化）
+
+因此：
+
+[
+\begin{aligned}
+\langle H \rangle_\theta &= \sum_\sigma H(\sigma) P_\theta(\sigma), \
+\langle H^2 \rangle_\theta &= \sum_\sigma H(\sigma)^2 P_\theta(\sigma), \
+\langle M \rangle_\theta &= \sum_\sigma M(\sigma) P_\theta(\sigma), \
+\langle M^2 \rangle_\theta &= \sum_\sigma M(\sigma)^2 P_\theta(\sigma).
+\end{aligned}
+]
+
+这些都可以按你之前分析的方式展开成若干“乘积项”，用 TNN 的高维积分器算出来。
+
+### 4.2 从期望到物理量
+
+* 比热（定体）：
+  [
+  C_\theta = \frac{\beta_0^2}{N}\left(\langle H^2\rangle_\theta - \langle H\rangle_\theta^2\right)
+  ]
+* 磁化率：
+  [
+  \chi_\theta = \frac{\beta_0}{N}\left(\langle M^2\rangle_\theta - \langle M\rangle_\theta^2\right)
+  ]
+
+**在代码上，你只需要在 TNN 模块里提供几种“带权求和”接口**，然后一行公式转换成 (C_\theta, \chi_\theta)。
+
+---
+
+## 第 5 步：和 REMC 分析结果对比（作为论文图）
+
+还记得第 1 步里调用的：
+
+```python
+results = sim.analyze(verbose=True)
+```
+
+它在温度 `T_2.269185` 那个条目里有：
+
+* `results["T_2.269185"]["C"]`  → MC 比热
+* `results["T_2.269185"]["chi"]` → MC 磁化率
+* 还有 `U`（Binder 累积量）、误差条等
+
+**对比方式（最小版）：**
+
+* 选定 T0=2.269185、L=32，做一个表格或一个小图：
+
+  * 行：`MC`, `TNN`
+  * 列：`<E>/N`, `<M>/N`, `C`, `chi`
+* 要求：TNN 预测值都落在 MC 误差条内，或者相对误差非常小。
+
+稍微豪华一点，可以：
+
+* 选 3 个温度：`T1 < Tc`, `T2 ≈ Tc`, `T3 > Tc`
+* 对每个 T 单独训练一个 TNN，得到 `C_theta(Ti)`、`chi_theta(Ti)`，然后在图上画出：
+
+  * MC 的点连成线
+  * TNN 的点（带误差条）叠在同一张图
+
+**这在论文里可以卖一个核心观点：**
+
+> “我们提出的 TNN 插值框架，可以直接在高维自旋空间逼近 (\log P(\sigma;T))，并通过对 TNN 进行解析积分，精确恢复出 Ising 模型在临界附近的比热和磁化率等热力学导数。这表明我们的插值不仅在函数值层面准确，而且在高阶导数（物理量）层面同样可信。”
+
+---
+
+## 总结一下这个“最小工作流”
+
+**一步话概括：**
+
+1. **REMC 生成 HDF5 格点样本** → 高维自变量 (\sigma)
+2. **从 HDF5 抽一个温度 T0 的样本** → 构建训练集
+3. **用 TNN 拟合 (\log P(\sigma;T_0))**（通过最大似然 + 精确 (Z_\theta)）
+4. **用 TNN 做高维积分** → (\langle H\rangle_\theta, \langle M\rangle_\theta, C_\theta, \chi_\theta)
+5. **和 REMC 的 “真值” 对比** → 作为插值论文的核心示例图。
+
+如果你愿意，下一步我可以帮你把**“TNN 侧”**也写成一个更具体的接口设计（比如 `TNNModel` 需要提供哪些函数：`forward`, `log_partition_function`, `expectation(F)` 等），这样你可以直接按这个接口实现 /改写你已有的 TNN 代码。
+
+
