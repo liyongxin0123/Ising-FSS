@@ -107,6 +107,49 @@ def _make_generator_from_seed(seed: int, prefer: str = PREFERRED_RNG) -> np.rand
         return np.random.default_rng(int(s))
 
 
+# -----------------------
+# 简易 τ_int 与 ESS（与 CPU remc_simulator 统一）
+# -----------------------
+def _tau_int_sokal(x: np.ndarray, max_lag: Optional[int] = None) -> float:
+    """
+    Sokal 建议的积分自相关时间估计：
+        tau_int = 0.5 + sum_{k=1..W} rho(k)
+    其中 rho(k) 是归一化自相关函数，W 取到 rho(k)<=0 为止或最大 lag。
+    """
+    s = np.asarray(x, dtype=float)
+    n = int(s.size)
+    if n < 4:
+        return 1.0
+    s = s - float(np.mean(s))
+    var = float(np.var(s))
+    if var <= 0.0:
+        return 1.0
+    if max_lag is None:
+        max_lag = min(n // 2, 1000)
+    tau = 0.5
+    for k in range(1, max_lag + 1):
+        num = float(np.dot(s[:-k], s[k:])) / (n - k)
+        rho = num / var
+        if rho <= 0.0:
+            break
+        tau += rho
+    return max(1.0, float(tau))
+
+
+def _ess_from_series(x: np.ndarray, tau: Optional[float] = None) -> float:
+    """
+    简易有效样本数估计：
+        ESS ≈ N / (2 * tau_int)
+    只用于报告，不用于决定生产步数。
+    """
+    n = float(len(x))
+    if n <= 0:
+        return 0.0
+    if tau is None:
+        tau = _tau_int_sokal(np.asarray(x, dtype=float))
+    return max(1.0, n / (2.0 * float(tau)))
+
+
 @dataclass
 class _GReplica:
     beta: float
@@ -267,6 +310,11 @@ class GPU_REMC_Simulator:
 
         self.sweep_index = 0
         self.rng_offset_within_sweep = 0
+
+        # 自适应 thin 的全局冷却期（以“生产阶段 sweep”计）
+        self._thin_global_last_update_step: int = -10**9
+        # 用于记录每个温度最近一次 τ_int/ESS 报告
+        self._last_tau: Dict[str, Dict[str, float]] = {}
 
     # ------------------------------------------------------------------
     # 基础工具
@@ -622,19 +670,28 @@ class GPU_REMC_Simulator:
         unit_sanity_check: bool = True,
     ) -> None:
         """
-        GPU 版 run 与 CPU 版接口保持一致，但当前实现：
-          - 忽略 auto_thin / tau_* 参数，不做自适应 thin（thin 固定为传入值）。
-          - unit_sanity_check 生效：对每个采样点做简单的单位检查。
+        GPU 版 run 与 CPU HybridREMCSimulator 接口保持一致：
+
+        - 若 auto_thin=False：使用固定的 thin（采样间隔）；
+        - 若 auto_thin=True：
+            * 利用每个温度槽的 |M| 时间序列估计积分自相关时间 tau_int（Sokal 公式）；
+            * 为每个温度槽给出局部建议 thin_T ≈ 2 * tau_int；
+            * 取所有温度中的最大值作为全局 thin_local，并带有“冷却期”和“25% 相对变化阈值”防止抖动；
+            * 仅修改采样间隔，不会更改 production_steps，也不做基于 ESS 的“自动收敛判断”。
+
+        这样可以：先在 CPU 上大致摸一个生产步数范围，然后 GPU 上用 auto_thin 自动调整 thin；
+        若样本数量不够，则通过 checkpoint 续跑补样。
         """
         R = len(self.replicas)
         thin_local = int(max(1, thin if thin is not None else 1))
 
-        if auto_thin:
-            # 当前 GPU 版本不做自适应 thinning，只提示一次
-            self._log_warn(
-                "[GPU_REMC_Simulator.run] auto_thin=True is not implemented on GPU; using fixed thin="
-                f"{thin_local}."
-            )
+        # 自适应 thin 相关参数（单位：sweep，而非样本）
+        _thin_k = int(tau_update_interval if tau_update_interval is not None else 256)
+        _thin_W = int(max(256, tau_window))
+        _tau_last: Dict[str, Optional[float]] = {f"T_{T:.6f}": None for T in self.temps}
+        _thin_last_update_step: Dict[str, int] = {f"T_{T:.6f}": -10**9 for T in self.temps}
+        # 每次 run() 重置 _last_tau
+        self._last_tau = {}
 
         # ---------------------- HDF5 文件准备 ----------------------
         h5files: Dict[str, Tuple[Any, Any]] = {}
@@ -760,6 +817,9 @@ class GPU_REMC_Simulator:
             T_str = f"T_{T:.6f}"
             series[T_str] = {"E": [], "M": [], "absM": [], "M2": [], "M4": []}
 
+        # 生产阶段只用本地 step_counter 计数（不含预热），CPU 版也是这样
+        step_counter = 0
+
         for t in range(int(production_steps)):
             self.rng_offset_within_sweep = 0
             self._gpu_sweep_batch(n_sweeps=1, checkerboard=True)
@@ -769,7 +829,10 @@ class GPU_REMC_Simulator:
                 self._attempt_swaps_host(parity=0)
                 self._attempt_swaps_host(parity=1)
 
-            if (self.sweep_index % thin_local) == 0:
+            step_counter += 1
+
+            # ---- 按当前 thin_local 采样一次 ----
+            if (step_counter % thin_local) == 0:
                 Nsite = float(self.N)
                 E_vec, M_vec = None, None
                 try:
@@ -863,6 +926,90 @@ class GPU_REMC_Simulator:
                                     pass
                             except Exception:
                                 pass
+
+            # ---- 在线 τ_int → 自适应 thin ----
+            if auto_thin and ((t + 1) % _thin_k == 0):
+                proposed: List[int] = []
+                for r, T in enumerate(self.temps):
+                    T_str = f"T_{T:.6f}"
+                    # 优先用 |M|，如果为空则退回 M
+                    m_ser = np.asarray(series[T_str]["absM"] or series[T_str]["M"], dtype=float)
+                    if m_ser.size >= max(64, _thin_W // 4):
+                        x = m_ser[-_thin_W:] if m_ser.size > _thin_W else m_ser
+                        # 1) 在 thinned 序列上估计 τ_int（单位：样本 index）
+                        try:
+                            tau_samples = float(_tau_int_sokal(x))
+                        except Exception:
+                            tau_samples = 1.0
+
+                        # 2) 把它还原成以 sweep 为单位的 τ_int
+                        #    当前 thin_local 表示“每 thin_local 个 sweep 取一个样本”
+                        #    所以 τ_sweeps ≈ tau_samples * thin_local
+                        tau_sweeps = max(1.0, tau_samples * float(thin_local))
+
+                        # 3) ESS 用的是样本单位的 τ（这是对“已有样本序列”的有效独立数）
+                        ess = float(_ess_from_series(x, tau=tau_samples))
+
+                        prev = _tau_last[T_str]
+                        can_update = ((t + 1) - _thin_last_update_step[T_str]) >= (5 * _thin_k)
+                        # 这里我们用“以 sweep 为单位的 τ”来比较是否变化较大
+                        should_update = (prev is None) or (
+                            abs(tau_sweeps - prev) / max(prev or 1.0, 1e-9) > 0.25
+            )
+
+                        # 4) 新的 thin 用 τ_sweeps 来算 —— 单位已经是 sweep
+                        new_thin = int(
+                            min(
+                                thin_max,
+                                max(thin_min, math.ceil(2.0 * float(tau_sweeps))),
+                            )
+                        )
+                        proposed.append(new_thin)
+
+                        if can_update and should_update:
+                            _tau_last[T_str] = float(tau_sweeps)  # 这里记的是“每多少个 sweep 相关”
+                            _thin_last_update_step[T_str] = (t + 1)
+
+                        # 记录详细信息，方便在 metadata 里检查
+                        self._last_tau[T_str] = {
+                            "tau_int_samples": float(tau_samples),   # 单位：样本 index
+                            "tau_int_sweeps": float(tau_sweeps),     # 单位：sweeps
+                            "ESS": float(ess),
+                            "thin": int(new_thin),
+                        }
+
+                        
+#                          try:
+                        #      tau = float(_tau_int_sokal(x))
+                        #  except Exception:
+                        #      tau = 1.0
+                        #  ess = float(_ess_from_series(x, tau=tau))
+                        #
+                        #  _prev = _tau_last[T_str]
+                        #  can_update = ((t + 1) - _thin_last_update_step[T_str]) >= (5 * _thin_k)
+                        #  should_update = (_prev is None) or (
+                        #      abs(tau - _prev) / max(_prev or 1.0, 1e-9) > 0.25
+                        #  )
+                        #
+                        #  new_thin = int(min(thin_max, max(thin_min, math.ceil(6.0 * float(tau)))))
+                        #  proposed.append(new_thin)
+                        #
+                        #  if can_update and should_update:
+                        #      _tau_last[T_str] = float(tau)
+                        #      _thin_last_update_step[T_str] = (t + 1)
+                        #  # 记录最近一次报告（便于写入 HDF5/JSON）
+                        #  self._last_tau[T_str] = {
+                        #      "tau_int": float(tau),
+                        #      "ESS": float(ess),
+                        #      "thin": int(new_thin),
+                        #  }
+#
+                if proposed:
+                    new_global = max(proposed)
+                    if ((t + 1) - self._thin_global_last_update_step) >= (5 * _thin_k):
+                        if abs(new_global - thin_local) / max(1, thin_local) > 0.25:
+                            thin_local = new_global
+                            self._thin_global_last_update_step = (t + 1)
 
         # 保存 E/M 序列到 _results
         self._results = {
@@ -987,6 +1134,11 @@ class GPU_REMC_Simulator:
                         prov.attrs["platform"] = platform.platform()
                     except Exception:
                         pass
+                    # 记录每个温度最近一次 τ_int/ESS 报告
+                    try:
+                        prov.attrs["tau_reports_json"] = json.dumps(getattr(self, "_last_tau", {}))
+                    except Exception:
+                        pass
 
                     # E/M 序列写入 HDF5
                     try:
@@ -1054,7 +1206,6 @@ class GPU_REMC_Simulator:
             meta_update = {
                 # JSON 里也叫 samples_per_temp，与 HDF5 一致
                 "samples_per_temp": sample_counters,
-                # 不再写入 final_seeds，避免与 replica_seeds 命名冗余
                 "swap_attempts": self._swap_attempts.tolist(),
                 "swap_accepts": self._swap_accepts.tolist(),
                 "rng_versions": self._rng_versions,
@@ -1547,8 +1698,6 @@ class GPU_REMC_Simulator:
             print(f"[gpu_remc.analyze] swap_rate={out['swap']['rate']:.4f}")
 
         return out
-
-
 
     def close(self):
         try:

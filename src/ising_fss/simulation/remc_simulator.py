@@ -688,23 +688,48 @@ class HybridREMCSimulator:
                     m_ser = np.asarray(series[T_str]["absM"] or series[T_str]["M"], dtype=float)
                     if m_ser.size >= max(64, _thin_W // 4):
                         x = m_ser[-_thin_W:] if m_ser.size > _thin_W else m_ser
+                        # 1) 在 thinned 序列上估计 τ_int（单位：样本 index）
                         try:
-                            tau = float(_tau_int_sokal(x))
+                            tau_samples = float(_tau_int_sokal(x))
                         except Exception:
-                            tau = 1.0
-                        ess = float(_ess_from_series(x, tau=tau))
+                            tau_samples = 1.0
 
-                        _prev = _tau_last[T_str]
+                        # 2) 把它还原成以 sweep 为单位的 τ_int
+                        #    当前 thin_local 表示“每 thin_local 个 sweep 取一个样本”
+                        #    所以 τ_sweeps ≈ tau_samples * thin_local
+                        tau_sweeps = max(1.0, tau_samples * float(thin_local))
+
+                        # 3) ESS 用的是样本单位的 τ（这是对“已有样本序列”的有效独立数）
+                        ess = float(_ess_from_series(x, tau=tau_samples))
+
+                        prev = _tau_last[T_str]
                         can_update = ((t + 1) - _thin_last_update_step[T_str]) >= (5 * _thin_k)
-                        should_update = (_prev is None) or (abs(tau - _prev) / max(_prev or 1.0, 1e-9) > 0.25)
+                        # 这里我们用“以 sweep 为单位的 τ”来比较是否变化较大
+                        should_update = (prev is None) or (
+                            abs(tau_sweeps - prev) / max(prev or 1.0, 1e-9) > 0.25
+            )
 
-                        new_thin = int(min(thin_max, max(thin_min, math.ceil(6.0 * float(tau)))))
+                        # 4) 新的 thin 用 τ_sweeps 来算 —— 单位已经是 sweep
+                        new_thin = int(
+                            min(
+                                thin_max,
+                                max(thin_min, math.ceil(2.0 * float(tau_sweeps))),
+                            )
+                        )
                         proposed.append(new_thin)
 
                         if can_update and should_update:
-                            _tau_last[T_str] = float(tau)
+                            _tau_last[T_str] = float(tau_sweeps)  # 这里记的是“每多少个 sweep 相关”
                             _thin_last_update_step[T_str] = (t + 1)
-                        self._last_tau[T_str] = {"tau_int": float(tau), "ESS": float(ess), "thin": int(new_thin)}
+
+                        # 记录详细信息，方便在 metadata 里检查
+                        self._last_tau[T_str] = {
+                            "tau_int_samples": float(tau_samples),   # 单位：样本 index
+                            "tau_int_sweeps": float(tau_sweeps),     # 单位：sweeps
+                            "ESS": float(ess),
+                            "thin": int(new_thin),
+                        }
+
 
                 if proposed:
                     new_global = max(proposed)

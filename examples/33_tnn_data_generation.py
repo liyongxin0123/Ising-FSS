@@ -1,4 +1,4 @@
-# examples/analysis/tnn_data_generation.py
+# examples/tnn_data_generation.py
 """
 为张量网络 (TNN) / TNR 生成多 L 的热力学统计数据 (NPZ)。
 """

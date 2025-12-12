@@ -1,4 +1,4 @@
-# examples/config/inline_config_quick_start.py
+# examples/inline_config_quick_start.py
 """
 在脚本中直接构造 Config，然后用其中的 simulation 配置跑一次 REMC。
 """

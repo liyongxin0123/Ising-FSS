@@ -660,7 +660,9 @@ class FSSAnalyzer:
         self,
         use_all_pairs: bool = True,
         bounds: Optional[Tuple[float, float]] = None,
+        #  weight_by: str = "uniform",   # 'slope' | 'uniform'
         weight_by: str = "slope",   # 'slope' | 'uniform'
+        #  smoothing: str = "savgol",
         smoothing: str = "none",
         window: int = 7,
         polyorder: int = 2,

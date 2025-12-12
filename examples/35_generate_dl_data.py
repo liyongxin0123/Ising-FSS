@@ -1,4 +1,4 @@
-# examples/ml/generate_dl_data.py
+# examples/generate_dl_data.py
 """
 从 REMC HDF5 输出生成适合 PyTorch 的训练集格式。
 

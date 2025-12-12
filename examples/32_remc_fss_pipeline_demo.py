@@ -179,7 +179,6 @@ def build_fss_results_for_sizes(
         - E, M, C, chi, U
         - 及其误差：E_err, M_err, C_err, chi_err, U_err
         - 以及兼容 FSSAnalyzer 的：E_stderr, M_stderr, C_stderr, chi_stderr, U_stderr
-        - 以及可选的 *_samples 数组（若 analyze() 提供）。
     """
     all_results: Dict[int, Dict[float, Dict[str, Any]]] = {}
     for L in L_list:

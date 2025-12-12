@@ -70,6 +70,5 @@ def main():
         print("[WARN] Read-back via IsingH5Dataset failed:", e)
 
 if __name__ == "__main__":
-    # 多进程/REMC 场景务必加这一行保护
     main()
 

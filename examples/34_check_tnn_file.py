@@ -1,4 +1,4 @@
-# examples/analysis/check_tnn_file.py
+# examples/check_tnn_file.py
 """
 检查单个 tnn_L*.npz 文件的内容，并画出简单曲线。
 """

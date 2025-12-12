@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-run_dispatcher_remc.py  (fixed without dispatcher.resolve)
+run_dispatcher_remc.py
 ----------------------------------------------------------
 功能与原脚本相同：
   - 统一规范/校验：算法名、PBC+棋盘 L 偶数、h≠0 禁簇；
@@ -33,7 +33,7 @@ except Exception:
     GPU_REMC_Simulator = None  # 按需回退
 
 # ====================== 可配置区域 ======================
-OUTDIR        = Path("runs/dispatcher_remc_demo")
+OUTDIR        = Path("runs/dispatcher_remc_remc")
 L             = 64              # PBC+Metropolis 需偶数
 H_FIELD       = 0.0
 ALGO          = "metropolis"    # h=0 也可 wolff；GPU 仅支持 Metropolis

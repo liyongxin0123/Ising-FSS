@@ -1,4 +1,4 @@
-# examples/config/run_sim_with_from_args.py
+# examples/run_sim_with_from_args.py
 """
 使用 Config.from_args() + 命令行 --preset / --set / ENV 来驱动 REMC。
 """

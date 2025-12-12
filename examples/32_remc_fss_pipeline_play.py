@@ -1,25 +1,15 @@
-# examples/gpu_large_scale_fss.py
+# examples/cpu_remc_large_scale_fss.py
 """
-使用 GPU REMC 对大 L 系统做 FSS 的脚本。
+基于 CPU / HybridREMCSimulator 的 REMC → FSS 管线脚本。
 
-功能要点
---------
-1. 支持多次运行同一个 outdir，自动“累计样本”：
-   - 每次 run 结束之后，会把当前 run 的 analyze() 结果
-     和 outdir/raw_results.json 中已有的同一 L 的结果合并：
-       * 对每个温度 T_...：把 E_samples / M_samples 拼接，再重新算 E/C/chi/U
-       * 对 swap：尝试把 attempts / accepts 累加
-   - 这样多次运行就等价于“追加样本”。
-
-2. 支持按 L 级别的 checkpoint 恢复：
-   - 每个 L 在 outdir 下对应一个 checkpoint 文件：
-       checkpoint_L{L}.json  + checkpoint_L{L}.json.npz
-   - 若指定 --resume，则在 run 之前尝试从对应 checkpoint 恢复；
-   - 无 checkpoint 时会提示“找不到，改为从头开始”。
-
-3. 支持只跑单个 L（例如只追加 L=128 的样本），同时保留旧的 L=64,96 的统计：
-   - raw_results.json 里的其它 L 会原样保留；
-   - FSS 分析时会用所有 L 的合并结果。
+目标：
+- 行为尽量模仿 gpu_large_scale_fss.py（42_gpu_large_scale_fss.py）：
+  * 支持多次运行同一个 outdir，自动在 raw_results.json 里“追加样本”；
+  * 每次 run 之后都用 FSSAnalyzer 做一次 Tc / γ/ν / 数据塌缩分析；
+  * 把 Binder U 的 crossing 信息写入 Tc_est.json。
+- 区别：
+  * 这里用的是 HybridREMCSimulator（CPU / 混合实现），而不是 GPU 版模拟器；
+  * 暂不做 checkpoint 恢复（可以以后再按 remc_simulator 的接口加上）。
 """
 
 from __future__ import annotations
@@ -32,7 +22,7 @@ from typing import Dict, Any
 
 import numpy as np
 
-# CuPy 是可选的：没有 GPU 也不至于 import 崩掉
+# CuPy 是可选的：没有 GPU 也不会影响 CPU 版脚本
 try:
     import cupy as cp  # type: ignore
     from cupy import ndarray as cupy_ndarray  # type: ignore
@@ -47,12 +37,12 @@ for p in (ROOT, ROOT / "src"):
     if s not in sys.path:
         sys.path.insert(0, s)
 
-from ising_fss.simulation.dispatcher import make_replica_seeds, gpu_available
-from ising_fss.simulation.gpu_remc_simulator import GPU_REMC_Simulator  # noqa: E402
-from ising_fss.analysis.fss_analyzer import FSSAnalyzer  # noqa: E402
+from ising_fss.simulation.remc_simulator import HybridREMCSimulator
+from ising_fss.simulation.dispatcher import make_replica_seeds
+from ising_fss.analysis.fss_analyzer import FSSAnalyzer
 
 
-# ---------- JSON 序列化 helper ----------
+# ---------- json.dump helper ----------
 def json_default(o):
     """
     让 json.dump 能处理 numpy / cupy / set 等类型：
@@ -91,10 +81,11 @@ def json_default(o):
     return repr(o)
 
 
-# ---------- FSSAnalyzer 需要的格式转换 ----------
+# ---------- 原始 analyze() → FSSAnalyzer 输入格式 ----------
+
 def to_fss_format(res_raw: Dict[str, Any]) -> Dict[float, Dict[str, Any]]:
     """
-    将 GPU 模拟器的原始输出转换为 FSSAnalyzer 需要的格式：
+    将 REMC 模拟器的原始 analyze() 输出转换为 FSSAnalyzer 需要的格式：
 
         输入：res_raw = {
             "T_2.100000": {...},
@@ -114,20 +105,15 @@ def to_fss_format(res_raw: Dict[str, Any]) -> Dict[float, Dict[str, Any]]:
     并且在这里尽量把标量 / 数组都转成 float64，避免精度退化。
     """
     out: Dict[float, Dict[str, Any]] = {}
+
     for key, val in res_raw.items():
-        if not isinstance(key, str):
-            continue
-        if not key.startswith("T_"):
-            # 跳过 'swap', 'field', 'rng_model' 等非温度键
-            continue
-        if not isinstance(val, dict):
+        if not (isinstance(key, str) and key.startswith("T_") and isinstance(val, dict)):
             continue
         try:
             T = float(key.split("_", 1)[1])
         except Exception:
             continue
 
-        # 对该温度块内的字段做一次“float64 化”
         obs: Dict[str, Any] = {}
         for k, x in val.items():
             # 标量类：转成 numpy.float64（或 Python float 也等价于双精度）
@@ -148,7 +134,8 @@ def to_fss_format(res_raw: Dict[str, Any]) -> Dict[float, Dict[str, Any]]:
     return out
 
 
-# ---------- 合并多次 run 的 analyze() 结果 ----------
+# ---------- 合并多次 run：old + new ----------
+
 def merge_analyze_for_one_L(
     old_L: Dict[str, Any],
     new_L: Dict[str, Any],
@@ -279,22 +266,24 @@ def merge_analyze_for_one_L(
                     c_all = (c_old + c_new)
                 else:
                     c_all = c_new
-                total_attempt = int(np.sum(a_all))
-                total_accept = int(np.sum(c_all))
                 merged[key] = {
-                    "attempts": a_all.tolist(),
-                    "accepts": c_all.tolist(),
-                    "rate": float(total_accept) / max(1, total_attempt),
+                    "attempts": a_all,
+                    "accepts": c_all,
+                    "total_attempts": int(np.sum(a_all)),
+                    "total_accepts": int(np.sum(c_all)),
                 }
             else:
-                # 结构不匹配时，直接用新的
                 merged[key] = new_block
 
+        # --- 其它键：优先 new，其次 old ---
         else:
-            # 其它键：优先采用 new_L 中的
+            if key in old_L and key not in merged:
+                # old 里有、new 里没有的键，先放 old
+                merged[key] = old_L[key]
+            # new 中的值覆盖 old
             merged[key] = new_block
 
-    # 再遍历 old_L，把 new_L 中没有覆盖的键补进来
+    # 再把 old_L 里遗漏的键补上
     for key, old_block in old_L.items():
         if key not in merged:
             merged[key] = old_block
@@ -302,10 +291,11 @@ def merge_analyze_for_one_L(
     return merged
 
 
-# ---------- 单个 L 的运行封装 ----------
+# ---------- CPU 版：跑单个 L 的 REMC ----------
+
 def run_one_L(L: int, outdir: Path, args) -> Dict[str, Any]:
     """
-    跑单个 L 的 GPU REMC，返回 GPU 模拟器的原始 analyze() 结果：
+    跑单个 L 的 HybridREMCSimulator REMC，返回 sim.analyze() 的原始结果：
         {
           "T_2.100000": {...},
           "T_2.225664": {...},
@@ -318,27 +308,24 @@ def run_one_L(L: int, outdir: Path, args) -> Dict[str, Any]:
     T_max = float(args.T_max)
     num_replicas = int(args.num_replicas)
 
-    replica_seeds = make_replica_seeds(master_seed=L * 10, n_replicas=num_replicas)
+    replica_seeds = make_replica_seeds(master_seed=10_000 + int(L), n_replicas=num_replicas)
 
-    sim = GPU_REMC_Simulator(
+    print(
+        f"\n=== 运行 REMC (CPU 版): L={L}, "
+        f"T∈[{T_min}, {T_max}], replicas={num_replicas}, algo=metropolis_sweep ==="
+    )
+
+    sim = HybridREMCSimulator(
         L=L,
         T_min=T_min,
         T_max=T_max,
         num_replicas=num_replicas,
-        algorithm="metropolis",  # 内部会 normalize 成 metropolis_sweep
+        algorithm="metropolis_sweep",
         h=0.0,
         replica_seeds=replica_seeds,
     )
 
-    # ---- checkpoint 恢复（可选）----
-    ck_path = outdir / f"checkpoint_L{L}.json"
-    if args.resume and ck_path.exists():
-        print(f"[L={L}] 🔄 从 checkpoint 恢复: {ck_path}")
-        _notes = sim.restore_from_checkpoint(str(ck_path))
-    elif args.resume:
-        print(f"[L={L}] ⚠️ 指定了 --resume 但找不到 checkpoint，改为从头开始。")
-
-    # ---- 运行 ----
+    # 每个 L 单独一个子目录，用于保存 lattices（若启用）
     save_dir_L = outdir / f"L{L}"
     save_dir_L.mkdir(parents=True, exist_ok=True)
 
@@ -350,81 +337,288 @@ def run_one_L(L: int, outdir: Path, args) -> Dict[str, Any]:
         verbose=bool(args.verbose),
         save_lattices=bool(args.save_lattices),
         save_dir=str(save_dir_L),
-        worker_id=f"gpu_L{L}",
-        auto_thin=bool(args.auto_thin),
-        thin_min=int(args.thin_min),
-        thin_max=int(args.thin_max),
-        tau_update_interval=int(args.tau_update_interval)
-        if args.tau_update_interval is not None
-        else None,
-        tau_window=int(args.tau_window),
+        worker_id=f"cpu_L{L}",
+        auto_thin=bool(getattr(args, "auto_thin", False)),
+        thin_min=int(getattr(args, "thin_min", 1)),
+        thin_max=int(getattr(args, "thin_max", 10_000)),
+        tau_update_interval=int(getattr(args, "tau_update_interval", 256)),
+        tau_window=int(getattr(args, "tau_window", 2048)),
     )
 
-    # ---- 保存 checkpoint，方便下次续跑 ----
-    try:
-        sim.save_checkpoint(str(ck_path))
-        print(f"[L={L}] ✅ checkpoint 已保存到 {ck_path}")
-    except Exception as exc:
-        print(f"[L={L}] ⚠️ 保存 checkpoint 失败: {exc}")
-
-    # ---- 分析 & 返回 ----
     res = sim.analyze(verbose=False)
     return res
 
 
-# ---------- 主程序 ----------
+# ---------- 小工具：按条目换行打印 Tc_est 结果 ----------
+
+def _pretty_print_Tc_est(label: str, est: Dict[str, Any]) -> None:
+    print(f"[INFO] {label} 结果:")
+
+    if not isinstance(est, dict):
+        print(f"  {est}")
+        return
+
+    for key in ("Tc", "var", "std"):
+        if key in est:
+            print(f"  {key}: {est[key]}")
+
+    if "weights" in est:
+        print("  weights:")
+        try:
+            for w in est["weights"]:
+                print(f"    - {w}")
+        except TypeError:
+            print(f"    {est['weights']}")
+
+    if "pairs" in est:
+        print("  pairs:")
+        try:
+            for pair in est["pairs"]:
+                try:
+                    L1, L2 = pair
+                    print(f"    - ({L1}, {L2})")
+                except Exception:
+                    print(f"    - {pair}")
+        except TypeError:
+            print(f"    {est['pairs']}")
+
+    if "crossings" in est:
+        print("  crossings:")
+        try:
+            for c in est["crossings"]:
+                try:
+                    L1 = getattr(c, "L1", None)
+                    L2 = getattr(c, "L2", None)
+                    Tc_c = getattr(c, "Tc", None)
+                    slope_diff = getattr(c, "slope_diff", None)
+                    bracket = getattr(c, "bracket", None)
+                    method = getattr(c, "method", "")
+                    note = getattr(c, "note", "")
+
+                    line = "    - "
+                    if L1 is not None and L2 is not None:
+                        line += f"L1={L1}, L2={L2}, "
+                    if Tc_c is not None:
+                        try:
+                            line += f"Tc={Tc_c:.6f}, "
+                        except Exception:
+                            line += f"Tc={Tc_c}, "
+                    if slope_diff is not None:
+                        try:
+                            line += f"slope_diff={slope_diff:.3f}, "
+                        except Exception:
+                            line += f"slope_diff={slope_diff}, "
+                    if bracket is not None:
+                        line += f"bracket={bracket}, "
+                    if method:
+                        line += f"method={method}"
+                    if note:
+                        line += f", note={note}"
+                    print(line)
+                except Exception:
+                    print(f"    - {c}")
+        except TypeError:
+            print(f"    {est['crossings']}")
+
+    for key, value in est.items():
+        if key in ("Tc", "var", "std", "weights", "pairs", "crossings"):
+            continue
+        print(f"  {key}: {value}")
+
+
+# ---------- 基于 raw_results 的 FSS 分析 ----------
+
+def run_fss_analysis_from_raw(
+    results_all_raw: Dict[str, Dict[str, Any]],
+    outdir: Path,
+    Tc_theory: float = 2.269185,
+) -> Dict[str, Any]:
+    """
+    使用合并后的 raw_results 做 FSS 分析：
+      - 先用 to_fss_format 转成 FSSAnalyzer 输入形式；
+      - 再补充 *_stderr 字段；
+      - 然后跑 Tc / γ/ν / 数据塌缩。
+    返回 estimate_Tc('U') 的完整字典。
+    """
+    print("\n=== 基于合并后的 raw_results 构建 FSSAnalyzer ===")
+
+    results_all_fss: Dict[int, Dict[float, Dict[str, Any]]] = {}
+    for L_key, block in results_all_raw.items():
+        try:
+            L_int = int(L_key)
+        except Exception:
+            continue
+
+        fss_block = to_fss_format(block)
+
+        # 给 FSSAnalyzer 补上 *_stderr 字段（沿用 *_err）
+        for obs in fss_block.values():
+            if not isinstance(obs, dict):
+                continue
+            for base in ("E", "M", "C", "chi", "U"):
+                err_key = f"{base}_err"
+                stderr_key = f"{base}_stderr"
+                if err_key in obs and stderr_key not in obs:
+                    val = obs[err_key]
+                    if isinstance(val, (int, float, np.floating)):
+                        obs[stderr_key] = float(val)
+
+        results_all_fss[L_int] = fss_block
+
+    if not results_all_fss:
+        print("⚠️ 没有可用的 FSS 数据（可能所有 L 都为空？）")
+        return {}
+
+    analyzer = FSSAnalyzer(results_all_fss, Tc_theory=Tc_theory)
+
+    # 1) Binder U 交叉 → Tc 估计
+    Tc_val = None
+    Tc_est: Dict[str, Any] = {}
+    try:
+        est = analyzer.estimate_Tc("U")
+        if isinstance(est, dict):
+            Tc_est = est
+            Tc_val = float(est.get("Tc", None))
+            _pretty_print_Tc_est("estimate_Tc('U')", est)
+        else:
+            Tc_val = float(est)
+            Tc_est = {"Tc": Tc_val}
+            print(f"[INFO] estimate_Tc('U') 得到 Tc ≈ {Tc_val:.6f}")
+    except Exception as e:
+        print("[WARN] estimate_Tc('U') 失败:", e)
+
+    if Tc_val is None:
+        Tc_val = Tc_theory
+        print(f"[INFO] 使用理论 Tc = {Tc_val:.6f} 作为后续拟合基准")
+    else:
+        print(f"[INFO] 估计 Tc ≈ {Tc_val:.6f} (理论值 Tc≈{Tc_theory})")
+
+    # 2) 用 χ 的 FSS 拟合 γ/ν
+    gamma_over_nu = None
+    try:
+        expo = analyzer.extract_critical_exponents(
+            observable="chi",
+            Tc_hint=Tc_val,
+            fit_nu=False,  # ν 已知为 1 的情形下，只拟合 γ/ν 更稳
+        )
+        print("exponents (from chi):", expo)
+
+        for k in ["gamma_over_nu", "exponent_ratio", "exponent"]:
+            if k in expo:
+                gamma_over_nu = float(expo[k])
+                print(f"[INFO] 识别到 {k} ≈ {gamma_over_nu:.4f}")
+                break
+    except TypeError:
+        expo = analyzer.extract_critical_exponents("chi")
+        print("exponents (from chi):", expo)
+        for k in ["gamma_over_nu", "exponent_ratio", "exponent"]:
+            if k in expo:
+                gamma_over_nu = float(expo[k])
+                print(f"[INFO] 识别到 {k} ≈ {gamma_over_nu:.4f}")
+                break
+    except Exception as e:
+        print("[WARN] 提取临界指数失败:", e)
+
+    if gamma_over_nu is not None:
+        print(
+            "[INFO] 理论值 γ/ν ≈ 1.75; "
+            f"当前拟合得到 γ/ν ≈ {gamma_over_nu:.4f}"
+        )
+        if gamma_over_nu < 0:
+            print("[WARN] γ/ν < 0 明显违背物理常识，说明采样或拟合还有问题。")
+    else:
+        print("[WARN] 未能从 expo 中识别出 γ/ν，后续 data collapse 将使用理论值。")
+        gamma_over_nu = 1.75
+
+    # 3) 做一次 χ 的数据塌缩
+    print("\n=== chi 数据塌缩 (CPU 版) ===")
+    if not hasattr(analyzer, "data_collapse"):
+        print("[INFO] 当前 FSSAnalyzer 未实现 data_collapse，跳过该步骤。")
+    else:
+        try:
+            collapse = analyzer.data_collapse(
+                observable="chi",
+                Tc=Tc_val,
+                nu=1.0,                # 2D Ising 的理论 ν = 1
+                exponent_ratio=gamma_over_nu,
+            )
+            print("data_collapse keys:", list(collapse.keys()))
+            if "score" in collapse:
+                print(f"collapse score ≈ {collapse['score']:.6g}")
+                print("（score 越小通常代表塌缩质量越好，仅供相对比较）")
+        except Exception as e:
+            print("[WARN] data_collapse 调用失败:", e)
+
+    # 写 Tc_est.json
+    Tc_path = outdir / "Tc_est.json"
+    try:
+        with open(Tc_path, "w", encoding="utf-8") as f:
+            json.dump(Tc_est, f, indent=2, default=json_default, ensure_ascii=False)
+        print(f"✅ Tc 估计与配对 crossing 信息已写入 {Tc_path}")
+    except Exception as exc:
+        print(f"❌ 写 Tc_est.json 失败: {exc}")
+
+    return Tc_est
+
+
+# ---------- main：整体管线 ----------
+
 def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--L_list", type=int, nargs="+", default=[64, 96, 128],
-                        help="要跑的 L 列表，例如: --L_list 64 96 128")
-    parser.add_argument("--outdir", default="runs/gpu_large_scale_fss",
-                        help="输出目录（raw_results.json / Tc_est.json / checkpoint 等）")
+    parser.add_argument("--L_list", type=int, nargs="+", default=[16, 32, 64],
+                        help="要跑的 L 列表，例如: --L_list 16 32 64")
+    parser.add_argument("--outdir", default="runs/cpu_large_scale_fss",
+                        help="输出目录（raw_results.json / Tc_est.json / lattices 等）")
 
-    # 物理 & 模拟参数
+    # 物理 & 模拟参数（默认取你原来 demo 的那一组）
     parser.add_argument("--T_min", type=float, default=2.1)
     parser.add_argument("--T_max", type=float, default=2.5)
-    parser.add_argument("--num_replicas", type=int, default=64)
+    parser.add_argument("--num_replicas", type=int, default=16)
 
-    parser.add_argument("--equil_steps", type=int, default=20000,
+    parser.add_argument("--equil_steps", type=int, default=20_000,
                         help="预热步数（sweeps）")
-    parser.add_argument("--prod_steps", type=int, default=100000,
+    parser.add_argument("--prod_steps", type=int, default=100_000,
                         help="生产阶段总 sweeps 数（不包含预热）")
-    parser.add_argument("--exchange_interval", type=int, default=10,
+    parser.add_argument("--exchange_interval", type=int, default=5,
                         help="每隔多少 sweeps 尝试一次 replica 交换")
 
-    parser.add_argument("--thin", type=int, default=50,
+    #  parser.add_argument("--thin", type=int, default=20,
+    #                      help="初始 thinning 间隔（sweeps）。若 --auto_thin，则作为起始 thin。")
+    parser.add_argument("--thin", type=int, default=200,
                         help="初始 thinning 间隔（sweeps）。若 --auto_thin，则作为起始 thin。")
 
-    # 自适应 thin 相关参数
+    # 自适应 thin 相关参数（HybridREMCSimulator 也支持）
     parser.add_argument("--auto_thin", action="store_true",
                         help="启用在线估计 τ_int 的自适应 thinning。")
     parser.add_argument("--thin_min", type=int, default=1,
                         help="自适应 thinning 的最小值（单位：sweeps）。")
-    parser.add_argument("--thin_max", type=int, default=10000,
+    parser.add_argument("--thin_max", type=int, default=10_000,
                         help="自适应 thinning 的最大值（单位：sweeps）。")
     parser.add_argument("--tau_update_interval", type=int, default=256,
-                        help="每隔多少个 production sweeps 做一次 τ_int 更新（内部计数单位：sweeps）。")
+                        help="每隔多少个 production sweeps 做一次 τ_int 更新。")
     parser.add_argument("--tau_window", type=int, default=2048,
                         help="估计 τ_int 时使用的窗口长度（最大历史样本数）。")
 
     # I/O & 其它
     parser.add_argument("--save_lattices", action="store_true",
                         help="是否把 lattice 轨迹写入 HDF5（每个温度一个文件）。")
-    parser.add_argument("--resume", action="store_true",
-                        help="若存在 checkpoint_L{L}.json，则从 checkpoint 续跑。")
     parser.add_argument("--verbose", action="store_true",
                         help="打印一些进度信息。")
 
     args = parser.parse_args()
 
-    if not gpu_available():
-        print("❌ GPU 不可用，本示例无法运行。")
-        return
-
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print("CPU REMC → FSSAnalyzer → Tc / γ/ν / 数据塌缩")
+    print("=" * 70)
+    print(
+        f"参数概览：L_list={args.L_list}, T∈[{args.T_min},{args.T_max}], "
+        f"replicas={args.num_replicas}, equil={args.equil_steps}, prod={args.prod_steps}, thin={args.thin}"
+    )
 
     # ---------- 读取旧的 raw_results.json（用于合并样本） ----------
     raw_path = outdir / "raw_results.json"
@@ -445,7 +639,7 @@ def main():
     results_all_raw: Dict[str, Dict[str, Any]] = {}
 
     for L in args.L_list:
-        print(f"=== GPU REMC for L={L} ===")
+        print(f"\n=== REMC for L={L} ===")
         res_new = run_one_L(L, outdir, args)
 
         L_key = str(L)
@@ -471,31 +665,8 @@ def main():
         print(f"❌ 写 raw_results.json 失败: {exc}")
         return
 
-    # ---------- 把所有 L 的结果喂给 FSSAnalyzer ----------
-    results_all_fss: Dict[int, Dict[float, Dict[str, Any]]] = {}
-    for L_key, block in results_all_raw.items():
-        try:
-            L_int = int(L_key)
-        except Exception:
-            continue
-        results_all_fss[L_int] = to_fss_format(block)
-
-    if not results_all_fss:
-        print("⚠️ 没有可用的 FSS 数据（可能所有 L 都为空？）")
-        return
-
-    analyzer = FSSAnalyzer(results_all_fss)
-    Tc_est = analyzer.estimate_Tc("U")
-
-    Tc_path = outdir / "Tc_est.json"
-    try:
-        with open(Tc_path, "w", encoding="utf-8") as f:
-            json.dump(Tc_est, f, indent=2, default=json_default, ensure_ascii=False)
-        print(f"✅ Tc 估计与配对 crossing 信息已写入 {Tc_path}")
-    except Exception as exc:
-        print(f"❌ 写 Tc_est.json 失败: {exc}")
-        return
-
+    # ---------- FSS 分析 ----------
+    Tc_est = run_fss_analysis_from_raw(results_all_raw, outdir=outdir)
     print("Done. See", outdir)
 
 

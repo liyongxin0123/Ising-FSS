@@ -61,7 +61,7 @@ if __name__ == "__main__":
     # ===== 读回一个样本做快速检查（可选）=====
     try:
         from ising_fss.analysis.dl_tools import IsingH5Dataset
-        # 注意：上面我们每个温度一个子目录；这里随便挑一个目录检查
+        # 注意：上面每个温度一个子目录；这里随便挑一个目录检查
         any_train = next((p / "train.h5" for p in (BASE_OUTDIR.iterdir())
                           if (p.is_dir() and (p / "train.h5").exists())), None)
         if any_train:
